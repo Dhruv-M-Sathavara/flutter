@@ -46,12 +46,7 @@ CATransform3D GetCATransform3DFromDlMatrix(const flutter::DlMatrix& matrix) {
 
 class CGPathReceiver final : public flutter::DlPathReceiver {
  public:
-  void SetPathInfo(flutter::DlPathFillType type, bool is_convex) override {
-    // CGPaths do not have an inherit fill type, we would need to remember
-    // the fill type and employ it when we use the path.
-    // see https://github.com/flutter/flutter/issues/164826
-  }
-  void MoveTo(const flutter::DlPoint& p2) override {  //
+  void MoveTo(const flutter::DlPoint& p2, bool will_be_closed) override {  //
     CGPathMoveToPoint(path_ref_, nil, p2.x, p2.y);
   }
   void LineTo(const flutter::DlPoint& p2) override {
@@ -69,7 +64,7 @@ class CGPathReceiver final : public flutter::DlPathReceiver {
   }
   void Close() override { CGPathCloseSubpath(path_ref_); }
 
-  CGMutablePathRef TakePath() { return path_ref_; }
+  CGMutablePathRef TakePath() const { return path_ref_; }
 
  private:
   CGMutablePathRef path_ref_ = CGPathCreateMutable();
@@ -420,6 +415,9 @@ static BOOL _preparedOnce = NO;
 
   CGPathReceiver receiver;
 
+  // TODO(flar): https://github.com/flutter/flutter/issues/164826
+  // CGPaths do not have an inherit fill type, we would need to remember
+  // the fill type and employ it when we use the path.
   dlPath.Dispatch(receiver);
 
   // The `matrix` is based on the physical pixels, convert it to UIKit points.
@@ -575,6 +573,39 @@ static BOOL _preparedOnce = NO;
   return NO;
 }
 
+- (void)searchAndFixWebView:(UIView*)view {
+  if ([view isKindOfClass:[WKWebView class]]) {
+    return [self searchAndFixWebViewGestureRecognzier:view];
+  } else {
+    for (UIView* subview in view.subviews) {
+      [self searchAndFixWebView:subview];
+    }
+  }
+}
+
+- (void)searchAndFixWebViewGestureRecognzier:(UIView*)view {
+  for (UIGestureRecognizer* recognizer in view.gestureRecognizers) {
+    // This is to fix a bug on iOS 26 where web view link is not tappable.
+    // We reset the web view's WKTouchEventsGestureRecognizer in a bad state
+    // by disabling and re-enabling it.
+    // See: https://github.com/flutter/flutter/issues/175099.
+    // See also: https://github.com/flutter/engine/pull/56804 for an explanation of the
+    // bug on iOS 18.2, which is still valid on iOS 26.
+    // Warning: This is just a quick fix that patches the bug. For example,
+    // touches on a drawing website is still not completely blocked. A proper solution
+    // should rely on overriding the hitTest behavior.
+    // See: https://github.com/flutter/flutter/issues/179916.
+    if (recognizer.enabled &&
+        [NSStringFromClass([recognizer class]) hasSuffix:@"TouchEventsGestureRecognizer"]) {
+      recognizer.enabled = NO;
+      recognizer.enabled = YES;
+    }
+  }
+  for (UIView* subview in view.subviews) {
+    [self searchAndFixWebViewGestureRecognzier:subview];
+  }
+}
+
 - (void)blockGesture {
   switch (_blockingPolicy) {
     case FlutterPlatformViewGestureRecognizersBlockingPolicyEager:
@@ -589,7 +620,17 @@ static BOOL _preparedOnce = NO;
       // from the web view plugin level. Right now we only observe this issue for
       // FlutterPlatformViewGestureRecognizersBlockingPolicyEager, but we should try it if a similar
       // issue arises for the other policy.
-      if (@available(iOS 18.2, *)) {
+      if (@available(iOS 26.0, *)) {
+        // This performs a nested DFS, with the outer one searching for any web view, and the inner
+        // one searching for a TouchEventsGestureRecognizer inside the web view. Once found, disable
+        // and immediately reenable it to reset its state.
+        // TODO(hellohuanlin): remove this flag after it is battle tested.
+        NSNumber* isWorkaroundDisabled =
+            [[NSBundle mainBundle] objectForInfoDictionaryKey:@"FLTDisableWebViewGestureReset"];
+        if (!isWorkaroundDisabled.boolValue) {
+          [self searchAndFixWebView:self.embeddedView];
+        }
+      } else if (@available(iOS 18.2, *)) {
         // This workaround is designed for WKWebView only. The 1P web view plugin provides a
         // WKWebView itself as the platform view. However, some 3P plugins provide wrappers of
         // WKWebView instead. So we perform DFS to search the view hierarchy (with a depth limit).
